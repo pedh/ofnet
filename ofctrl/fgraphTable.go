@@ -95,3 +95,10 @@ func (self *Table) Delete() error {
 	// FIXME: Delete the table
 	return nil
 }
+
+func NewTable(tableId uint8, sw *OFSwitch) *Table {
+	table := new(Table)
+	table.Switch = sw
+	table.TableId = tableId
+	return table
+}

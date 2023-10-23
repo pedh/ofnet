@@ -28,11 +28,53 @@ import (
 	"antrea.io/libOpenflow/common"
 	"antrea.io/libOpenflow/openflow15"
 	"antrea.io/libOpenflow/util"
-
 	log "github.com/sirupsen/logrus"
 )
 
-type PacketIn openflow15.PacketIn
+type PacketIn struct {
+	*openflow15.PacketIn
+	UserData     []byte
+	Continuation []byte
+}
+
+func parsePacktInFromNXPacketIn2(pktIn2 *openflow15.PacketIn2) *PacketIn {
+	pktIn := openflow15.NewPacketIn()
+	var userData, continuation []byte
+	for _, p := range pktIn2.Props {
+		switch v := p.(type) {
+		case *openflow15.PacketIn2PropPacket:
+			pktBytes, _ := v.Packet.MarshalBinary()
+			pktIn.Data = util.NewBuffer(pktBytes)
+		case *openflow15.PacketIn2PropCookie:
+			pktIn.Cookie = v.Cookie
+		case *openflow15.PacketIn2PropBufferID:
+			pktIn.BufferId = v.BufferID
+		case *openflow15.PacketIn2PropReason:
+			pktIn.Reason = v.Reason
+		case *openflow15.PacketIn2PropFullLen:
+			pktIn.TotalLen = uint16(v.FullLen)
+		case *openflow15.PacketIn2PropTableID:
+			pktIn.TableId = v.TableID
+		case *openflow15.PacketIn2PropMetadata:
+			pktIn.Match = openflow15.Match{
+				Type:   openflow15.MatchType_OXM,
+				Length: v.Len(),
+				Fields: v.Fields,
+			}
+		case *openflow15.PacketIn2PropUserdata:
+			userData = make([]byte, len(v.Userdata))
+			copy(userData, v.Userdata)
+		case *openflow15.PacketIn2PropContinuation:
+			continuation = make([]byte, len(v.Continuation))
+			copy(continuation, v.Continuation)
+		}
+	}
+	return &PacketIn{
+		PacketIn:     pktIn,
+		UserData:     userData,
+		Continuation: continuation,
+	}
+}
 
 // Note: Command to make ovs connect to controller:
 // ovs-vsctl set-controller <bridge-name> tcp:<ip-addr>:<port>
@@ -54,6 +96,10 @@ type AppInterface interface {
 
 	// Controller received a multi-part reply from the switch
 	MultipartReply(sw *OFSwitch, rep *openflow15.MultipartReply)
+
+	FlowGraphEnabledOnSwitch() bool
+
+	TLVMapEnabledOnSwitch() bool
 }
 
 type ConnectionRetryControl interface {

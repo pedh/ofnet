@@ -110,10 +110,10 @@ func (self *Meter) Delete() error {
 	return self.Switch.DeleteMeter(self.ID)
 }
 
-func newMeter(id uint32, flags MeterFlag, ofSwitch *OFSwitch) *Meter {
+func NewMeter(meterId uint32, flags MeterFlag, sw *OFSwitch) *Meter {
 	return &Meter{
-		ID:     id,
+		ID:     meterId,
 		Flags:  flags,
-		Switch: ofSwitch,
+		Switch: sw,
 	}
 }

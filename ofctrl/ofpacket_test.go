@@ -12,7 +12,6 @@ import (
 	"antrea.io/libOpenflow/openflow15"
 	"antrea.io/libOpenflow/protocol"
 	"antrea.io/libOpenflow/util"
-	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -47,27 +46,75 @@ func TestPacketIn_PacketOut(t *testing.T) {
 		assert.Nilf(t, ovsBr.DeleteBridge(brName), "Failed to delete br %s", brName)
 		ctrl.Delete()
 	}()
-
-	assert.Equal(t, 0, app.pktInCount)
-	testPacketInOut(t, app, brName, false)
-	assert.Equal(t, 1, app.pktInCount)
-}
-
-func TestPacketIn_PacketOut_IPv6(t *testing.T) {
-	app := new(packetApp)
-	app.OfActor = new(OfActor)
-	app.pktCh = make(chan *PacketIn)
-	ctrl := NewController(app)
-	brName := "br4pktv6"
-	ovsBr := prepareControllerAndSwitch(t, app.OfActor, ctrl, brName)
-	defer func() {
-		assert.Nilf(t, ovsBr.DeleteBridge(brName), "Failed to delete br %s", brName)
-		ctrl.Delete()
-	}()
-
-	assert.Equal(t, 0, app.pktInCount)
-	testPacketInOut(t, app, brName, true)
-	assert.Equal(t, 1, app.pktInCount)
+	app.Switch.EnableMonitor()
+	for _, tc := range []struct {
+		name         string
+		isIPv6       bool
+		controllerv2 bool
+		reason       uint8
+		userData     []byte
+		tcpDst       uint16
+		pause        bool
+	}{
+		{
+			name:         "ipv4-controller",
+			isIPv6:       false,
+			controllerv2: false,
+			reason:       1,
+			tcpDst:       1001,
+		}, {
+			name:         "ipv6-controller",
+			isIPv6:       true,
+			controllerv2: false,
+			reason:       1,
+			tcpDst:       1002,
+		}, {
+			name:         "ipv4-controller2-no-userdata",
+			isIPv6:       false,
+			controllerv2: true,
+			reason:       1,
+			tcpDst:       1003,
+		}, {
+			name:         "ipv6-controller2-no-userdata",
+			isIPv6:       true,
+			controllerv2: true,
+			reason:       1,
+			tcpDst:       1004,
+		}, {
+			name:         "ipv4-controller2-userdata",
+			isIPv6:       false,
+			controllerv2: true,
+			reason:       1,
+			tcpDst:       1005,
+			userData:     []byte{1, 2, 3},
+		}, {
+			name:         "ipv6-controller2-userdata",
+			isIPv6:       true,
+			controllerv2: true,
+			reason:       1,
+			tcpDst:       1005,
+			userData:     []byte{4, 5, 6},
+		}, {
+			name:         "ipv4-controller2-pause-resume",
+			isIPv6:       false,
+			controllerv2: true,
+			reason:       1,
+			tcpDst:       1005,
+			userData:     []byte{1, 2, 3},
+			pause:        true,
+		}, {
+			name:         "ipv6-controller2-pause-resume",
+			isIPv6:       true,
+			controllerv2: true,
+			reason:       1,
+			tcpDst:       1005,
+			pause:        true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			testPacketInOut(t, app, tc.isIPv6, tc.reason, tc.controllerv2, tc.tcpDst, tc.userData, tc.pause)
+		})
+	}
 }
 
 func TestNxOutputAndSendController(t *testing.T) {
@@ -101,15 +148,11 @@ func TestNxOutputAndSendController(t *testing.T) {
 	flow1.Send(openflow15.FC_ADD)
 	verifyFlowInstallAndDelete(t, flow1, NewEmptyElem(), brName, table0.TableId,
 		"priority=100,ip,dl_src=11:22:33:44:55:66",
-		fmt.Sprintf("output:NXM_NX_REG0[],controller(max_len=128,id=%d)", app.Switch.ctrlID))
+		fmt.Sprintf("output:NXM_NX_REG0[],controller(id=%d)", app.Switch.ctrlID))
 }
 
-func testPacketInOut(t *testing.T, ofApp *packetApp, brName string, ipv6 bool) {
-	log.Infof("Enable monitor flows on table %d in bridge %s", ofApp.inputTable.TableId, brName)
-	ofApp.Switch.EnableMonitor()
-
+func testPacketInOut(t *testing.T, ofApp *packetApp, ipv6 bool, reason uint8, controllerV2 bool, dstPort uint16, userData []byte, pause bool) {
 	ofSwitch := ofApp.Switch
-
 	srcMAC, _ := net.ParseMAC("11:22:33:44:55:66")
 	dstMAC, _ := net.ParseMAC("66:55:44:33:22:11")
 	var srcIP net.IP
@@ -121,7 +164,12 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, brName string, ipv6 bool) {
 		srcIP = net.ParseIP("1.1.1.2")
 		dstIP = net.ParseIP("2.2.2.1")
 	}
-	dstPort := uint16(1234)
+	// Set PacketIn format.
+	pktFmt := uint32(openflow15.OFPUTIL_PACKET_IN_STD)
+	if controllerV2 {
+		pktFmt = openflow15.OFPUTIL_PACKET_IN_NXT2
+	}
+	assert.NoError(t, ofSwitch.SetPacketInFormat(pktFmt))
 
 	table0 := ofSwitch.DefaultTable()
 	var ethertype uint16
@@ -156,9 +204,9 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, brName string, ipv6 bool) {
 		expectTunDst = net.ParseIP("10.10.10.10")
 	}
 	act5 := &SetTunnelDstAction{IP: expectTunDst}
-	cxControllerAct := &NXController{ControllerID: ofSwitch.ctrlID}
+	cxControllerAct := &NXController{Version2: controllerV2, ControllerID: ofSwitch.ctrlID, Reason: reason, UserData: userData, Pause: pause}
 	flow1.ApplyActions([]OFAction{act1, act2, act3, act5, cxControllerAct})
-	flow1.Send(openflow15.FC_ADD)
+	assert.NoError(t, flow1.Send(openflow15.FC_ADD))
 
 	act4 := actionToLoadDataToReg(3, 0xaaaa, rng2)
 	packetOut := generateTCPPacketOut(srcMAC, dstMAC, srcIP, dstIP, dstPort, 0, nil, []OFAction{act4})
@@ -178,6 +226,15 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, brName string, ipv6 bool) {
 	case <-time.After(10 * time.Second):
 		t.Fatalf("PacketIn timeout")
 	}
+
+	// Delete flow after the packetIn message is received.
+	assert.NoError(t, flow1.Delete())
+
+	// Validate packetIn.Reason.
+	assert.Equal(t, reason, pktIn.Reason)
+	// Validate packetIn.UserData.
+	assert.Equal(t, userData, pktIn.UserData)
+	// Validate packetIn.Match.
 	matchers := pktIn.GetMatches()
 	reg0Match := getMatchFieldByRegID(matchers, 0)
 	assert.NotNil(t, reg0Match)
@@ -221,6 +278,10 @@ func testPacketInOut(t *testing.T, ofApp *packetApp, brName string, ipv6 bool) {
 		assert.Equal(t, dstPort, tcpObj.PortDst)
 	} else {
 		assert.Equal(t, dstIP.To4(), ethData.Data.(*protocol.IPv4).NWDst)
+	}
+	if pause {
+		pktIn.Continuation = []byte{7, 8, 9}
+		assert.NoError(t, ofSwitch.ResumePacket(pktIn))
 	}
 }
 

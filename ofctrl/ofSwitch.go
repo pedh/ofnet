@@ -25,10 +25,10 @@ import (
 
 	"antrea.io/libOpenflow/common"
 	"antrea.io/libOpenflow/openflow15"
+	"antrea.io/libOpenflow/protocol"
 	"antrea.io/libOpenflow/util"
-
+	cmap "github.com/orcaman/concurrent-map/v2"
 	log "github.com/sirupsen/logrus"
-	cmap "github.com/streamrail/concurrent-map"
 )
 
 const (
@@ -46,15 +46,18 @@ type OFSwitch struct {
 	app    AppInterface
 	// Following are fgraph state for the switch
 	tableDb        map[uint8]*Table
+	tableDbMux     sync.Mutex
 	dropAction     *Output
 	sendToCtrler   *Output
 	normalLookup   *Output
 	ready          bool
-	portMux        sync.Mutex
 	statusMux      sync.Mutex
 	outputPorts    map[uint32]*Output
+	portMux        sync.Mutex
 	groupDb        map[uint32]*Group
+	groupDbMux     sync.Mutex
 	meterDb        map[uint32]*Meter
+	meterDbMux     sync.Mutex
 	connCh         chan int // Channel to notify controller connection status is changed
 	mQueue         chan *openflow15.MultipartRequest
 	monitorEnabled bool
@@ -69,13 +72,10 @@ type OFSwitch struct {
 	tlvMgr *tlvMapMgr
 }
 
-var switchDb cmap.ConcurrentMap
-var monitoredFlows cmap.ConcurrentMap
-
-func init() {
-	switchDb = cmap.New()
-	monitoredFlows = cmap.New()
-}
+var (
+	switchDb       = cmap.New[*OFSwitch]()
+	monitoredFlows = cmap.New[chan *openflow15.MultipartReply]()
+)
 
 // Builds and populates a Switch struct then starts listening
 // for OpenFlow messages on conn.
@@ -93,7 +93,9 @@ func NewSwitch(stream *util.MessageStream, dpid net.HardwareAddr, app AppInterfa
 		s.ctrlID = ctrlID
 
 		// Initialize the fgraph elements
-		s.initFgraph()
+		if app.FlowGraphEnabledOnSwitch() {
+			s.initFgraph()
+		}
 
 		// Save it
 		switchDb.Set(dpid.String(), s)
@@ -105,17 +107,19 @@ func NewSwitch(stream *util.MessageStream, dpid net.HardwareAddr, app AppInterfa
 	}
 	// Prepare a context for current connection.
 	s.ctx, s.cancel = context.WithCancel(context.Background())
-	s.tlvMgr = newTLVMapMgr()
+	if app.TLVMapEnabledOnSwitch() {
+		s.tlvMgr = newTLVMapMgr()
+	}
 	return s
 }
 
 // Returns a pointer to the Switch mapped to dpid.
 func getSwitch(dpid net.HardwareAddr) *OFSwitch {
-	sw, _ := switchDb.Get(dpid.String())
-	if sw == nil {
+	sw, ok := switchDb.Get(dpid.String())
+	if !ok {
 		return nil
 	}
-	return sw.(*OFSwitch)
+	return sw
 }
 
 // Returns the dpid of Switch s.
@@ -289,6 +293,10 @@ func (self *OFSwitch) handleMessages(dpid net.HardwareAddr, msg util.Message) {
 			reply := t.VendorData.(*openflow15.TLVTableReply)
 			status := TLVTableStatus(*reply)
 			self.tlvMgr.TLVMapReplyRcvd(self, &status)
+		case openflow15.Type_PacketIn2:
+			pktInMsg := t.VendorData.(*openflow15.PacketIn2)
+			pktIn := parsePacktInFromNXPacketIn2(pktInMsg)
+			self.app.PacketRcvd(self, pktIn)
 		}
 
 	case *openflow15.BundleCtrl:
@@ -311,7 +319,8 @@ func (self *OFSwitch) handleMessages(dpid net.HardwareAddr, msg util.Message) {
 	case *openflow15.PacketIn:
 		log.Debugf("Received packet(ofctrl): %+v", t)
 		// send packet rcvd callback
-		self.app.PacketRcvd(self, (*PacketIn)(t))
+		pktIn := &PacketIn{PacketIn: t}
+		self.app.PacketRcvd(self, pktIn)
 
 	case *openflow15.FlowRemoved:
 
@@ -327,17 +336,19 @@ func (self *OFSwitch) handleMessages(dpid net.HardwareAddr, msg util.Message) {
 
 	case *openflow15.MultipartReply:
 		log.Debugf("Received MultipartReply")
-		rep := (*openflow15.MultipartReply)(t)
-		if self.monitorEnabled {
-			key := fmt.Sprintf("%d", rep.Xid)
-			ch, found := monitoredFlows.Get(key)
+		switch t.Type {
+		case openflow15.MultipartType_FlowDesc:
+			key := fmt.Sprintf("%d", t.Xid)
+			replyChan, found := monitoredFlows.Get(key)
 			if found {
-				replyChan := ch.(chan *openflow15.MultipartReply)
-				replyChan <- rep
+				if self.monitorEnabled {
+					replyChan <- t
+				}
+				monitoredFlows.Remove(key)
 			}
 		}
 		// send packet rcvd callback
-		self.app.MultipartReply(self, rep)
+		self.app.MultipartReply(self, t)
 	case *openflow15.VendorError:
 		errData := t.ErrorMsg.Data.Bytes()
 		result := MessageResult{
@@ -426,18 +437,14 @@ func (self *OFSwitch) DumpFlowStats(cookieID uint64, cookieMask *uint64, flowMat
 	select {
 	case reply := <-replyChan:
 		flowStates := make([]*openflow15.FlowDesc, 0)
-		if reply.Type == openflow15.MultipartType_FlowDesc {
-			flowArr := reply.Body
-			for _, entry := range flowArr {
-				flowStates = append(flowStates, entry.(*openflow15.FlowDesc))
-			}
-			return flowStates, nil
+		flowArr := reply.Body
+		for _, entry := range flowArr {
+			flowStates = append(flowStates, entry.(*openflow15.FlowDesc))
 		}
-
+		return flowStates, nil
 	case <-time.After(2 * time.Second):
 		return nil, errors.New("timeout to wait for MultipartReply message")
 	}
-	return nil, nil
 }
 
 func (self *OFSwitch) CheckStatus(timeout time.Duration) bool {
@@ -494,4 +501,87 @@ func (self *OFSwitch) sendModPortMessage(port int, mac net.HardwareAddr, config 
 
 func (self *OFSwitch) GetControllerID() uint16 {
 	return self.ctrlID
+}
+
+func (self *OFSwitch) SetPacketInFormat(format uint32) error {
+	msg := openflow15.NewSetPacketInFormat(format)
+	return self.Send(msg)
+}
+
+func (self *OFSwitch) ResumePacket(pktIn *PacketIn) error {
+	var resumeProps []openflow15.Property
+	if pktIn.Data == nil {
+		return fmt.Errorf("no Ethernet packet in the message")
+	}
+	eth := protocol.NewEthernet()
+	pktBytes, err := pktIn.Data.MarshalBinary()
+	if err != nil {
+		return err
+	}
+	if err = eth.UnmarshalBinary(pktBytes); err != nil {
+		return err
+	}
+	packetProp := &openflow15.PacketIn2PropPacket{
+		Packet: *eth,
+		PropHeader: &openflow15.PropHeader{
+			Type: openflow15.NXPINT_PACKET,
+		},
+	}
+	packetProp.Length = packetProp.Len()
+	cookieProp := &openflow15.PacketIn2PropCookie{
+		Cookie: pktIn.Cookie,
+		PropHeader: &openflow15.PropHeader{
+			Type:   openflow15.NXPINT_COOKIE,
+			Length: 16,
+		},
+	}
+	bufferProp := &openflow15.PacketIn2PropBufferID{
+		BufferID: pktIn.BufferId,
+		PropHeader: &openflow15.PropHeader{
+			Type:   openflow15.NXPINT_BUFFER_ID,
+			Length: 8,
+		},
+	}
+	if pktIn.TotalLen > 0 {
+		lenProp := &openflow15.PacketIn2PropFullLen{
+			FullLen: uint32(pktIn.TotalLen),
+			PropHeader: &openflow15.PropHeader{
+				Type:   openflow15.NXPINT_FULL_LEN,
+				Length: 8,
+			},
+		}
+		resumeProps = append(resumeProps, lenProp)
+	}
+	tableProp := &openflow15.PacketIn2PropTableID{
+		TableID: pktIn.TableId,
+		PropHeader: &openflow15.PropHeader{
+			Type:   openflow15.NXPINT_TABLE_ID,
+			Length: 8,
+		},
+	}
+	reasonProp := &openflow15.PacketIn2PropReason{
+		Reason: pktIn.Reason,
+		PropHeader: &openflow15.PropHeader{
+			Type:   openflow15.NXPINT_REASON,
+			Length: 8,
+		},
+	}
+	matchProp := &openflow15.PacketIn2PropMetadata{
+		Fields: pktIn.Match.Fields,
+		PropHeader: &openflow15.PropHeader{
+			Type: openflow15.NXPINT_METADATA,
+		},
+	}
+	matchProp.Length = matchProp.Len()
+	continueProp := &openflow15.PacketIn2PropContinuation{
+		Continuation: make([]byte, len(pktIn.Continuation)),
+		PropHeader: &openflow15.PropHeader{
+			Type: openflow15.NXPINT_CONTINUATION,
+		},
+	}
+	copy(continueProp.Continuation, pktIn.Continuation)
+	continueProp.Length = continueProp.Len()
+	resumeProps = append(resumeProps, packetProp, cookieProp, bufferProp, tableProp, reasonProp, matchProp, continueProp)
+	resumeMsg := openflow15.NewResume(resumeProps)
+	return self.Send(resumeMsg)
 }
