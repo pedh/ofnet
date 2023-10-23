@@ -149,6 +149,11 @@ func NewController(app AppInterface) *Controller {
 	return c
 }
 
+// SetID sets the controller ID.
+func (c *Controller) SetID(id uint16) {
+	c.id = id
+}
+
 // Listen on a port
 func (c *Controller) Listen(port string) {
 	addr, _ := net.ResolveTCPAddr("tcp", port)
