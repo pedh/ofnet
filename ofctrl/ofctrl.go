@@ -100,6 +100,9 @@ type AppInterface interface {
 	FlowGraphEnabledOnSwitch() bool
 
 	TLVMapEnabledOnSwitch() bool
+
+	// PortStatusRcvd notifies AppInterface a new PortStatus message is received.
+	PortStatusRcvd(status *openflow15.PortStatus)
 }
 
 type ConnectionRetryControl interface {
