@@ -325,7 +325,8 @@ func (self *OFSwitch) handleMessages(dpid net.HardwareAddr, msg util.Message) {
 	case *openflow15.FlowRemoved:
 
 	case *openflow15.PortStatus:
-		// FIXME: This needs to propagated to the app.
+		// Propagate the PortStatus message to the app.
+		self.app.PortStatusRcvd(t)
 	case *openflow15.PacketOut:
 
 	case *openflow15.FlowMod:

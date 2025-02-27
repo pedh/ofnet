@@ -15,6 +15,7 @@ limitations under the License.
 package ofctrl
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"net"
@@ -41,6 +42,8 @@ type OfActor struct {
 	pktInCount     int
 	tlvTableStatus *TLVTableStatus
 	tlvMapCh       chan struct{}
+
+	portStatusCh chan *openflow15.PortStatus
 }
 
 func (o *OfActor) PacketRcvd(sw *OFSwitch, packet *PacketIn) {
@@ -79,6 +82,12 @@ func (o *OfActor) FlowGraphEnabledOnSwitch() bool {
 
 func (o *OfActor) TLVMapEnabledOnSwitch() bool {
 	return true
+}
+
+func (o *OfActor) PortStatusRcvd(status *openflow15.PortStatus) {
+	if o.portStatusCh != nil {
+		o.portStatusCh <- status
+	}
 }
 
 // Controller/Application/ovsBr work on clientMode
@@ -2386,4 +2395,78 @@ func TestWriteactionsFlows(t *testing.T) {
 		"priority=200,actset_output=105,ip",
 		"conjunction(101,2/3)")
 
+}
+
+func TestPortStatusRcvd(t *testing.T) {
+	app := new(OfActor)
+	ctrl := NewController(app)
+	brName := "br4PortStatus"
+	ovsBr := prepareControllerAndSwitch(t, app, ctrl, brName)
+	defer func() {
+		assert.Nilf(t, ovsBr.DeleteBridge(brName), "Failed to delete br %s", brName)
+		ctrl.Delete()
+	}()
+
+	portStatusCh := make(chan *openflow15.PortStatus)
+	app.portStatusCh = portStatusCh
+
+	for _, tc := range []struct {
+		name          string
+		portName      string
+		portNo        int
+		requestOFPort bool
+	}{
+		{
+			name:          "OVS port without ofport_request",
+			portName:      "p1",
+			portNo:        1,
+			requestOFPort: false,
+		}, {
+			name:          "OVS port with ofport_request",
+			portName:      "p2",
+			portNo:        100,
+			requestOFPort: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// OVSDB operation to add port.
+			cmd := fmt.Sprintf("ovs-vsctl --may-exist add-port %s %s -- set Interface %s type=internal", brName, tc.portName, tc.portName)
+			if tc.requestOFPort {
+				cmd = fmt.Sprintf("%s ofport_request=%d", cmd, tc.portNo)
+			}
+			err := exec.Command("/bin/bash", "-c", cmd).Run()
+			require.NoError(t, err)
+
+			// Verifications on the PortStatus message -- Add.
+			addPort := <-portStatusCh
+			assert.Equal(t, openflow15.PR_ADD, int(addPort.Reason))
+			assert.Equal(t, openflow15.PS_LINK_DOWN, int(addPort.Desc.State))
+			assert.Equal(t, tc.portName, string(bytes.Trim(addPort.Desc.Name, "\x00")))
+			assert.Equal(t, tc.portNo, int(addPort.Desc.PortNo))
+
+			// Set ip link up.
+			cmd = fmt.Sprintf("ip link set %s up", tc.portName)
+			err = exec.Command("/bin/bash", "-c", cmd).Run()
+			require.NoError(t, err)
+
+			// Verifications on the PortStatus message -- Modify.
+			modPort := <-portStatusCh
+			assert.Equal(t, openflow15.PR_MODIFY, int(modPort.Reason))
+			assert.Equal(t, openflow15.PS_LIVE, int(modPort.Desc.State))
+			assert.Equal(t, tc.portName, string(bytes.Trim(modPort.Desc.Name, "\x00")))
+			assert.Equal(t, tc.portNo, int(modPort.Desc.PortNo))
+
+			// OVSDB operation to delete port.
+			cmd = fmt.Sprintf("ovs-vsctl del-port %s %s", brName, tc.portName)
+			err = exec.Command("/bin/bash", "-c", cmd).Run()
+			require.NoError(t, err)
+
+			// Verifications on the PortStatus message -- Delete.
+			delPort := <-portStatusCh
+			assert.Equal(t, openflow15.PR_DELETE, int(delPort.Reason))
+			assert.Equal(t, openflow15.PS_LIVE, int(delPort.Desc.State))
+			assert.Equal(t, tc.portName, string(bytes.Trim(delPort.Desc.Name, "\x00")))
+			assert.Equal(t, tc.portNo, int(delPort.Desc.PortNo))
+		})
+	}
 }
